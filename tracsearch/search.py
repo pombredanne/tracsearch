@@ -1,5 +1,6 @@
-from pyelasticsearch import ElasticSearch
-from pyelasticsearch.exceptions import ElasticHttpNotFoundError
+# FIXME use elasticsearch, not pyelasticsearch
+from elasticsearch import Elasticsearch
+from elasticsearch.helpers import bulk
 
 
 def datetimeformat(raw):
@@ -7,114 +8,54 @@ def datetimeformat(raw):
     return "%s-%s-%sT%s" % (raw[0:4], raw[4:6], raw[6:8], raw[9:])
 
 
-class Search(object):
-    def __init__(self, index,  url, bulk_size=100, settings=None):
-        self._index = index
-        self.es = ElasticSearch(url)
-        self._bulk = {}
-        self.bulk_size = bulk_size
-        self._settings = settings
-
-    def delete(self):
-        try:
-            assert self.es.delete_index(self._index)['ok']
-        except ElasticHttpNotFoundError:
-            pass
-
-    def create(self):
-        assert self.es.create_index(self._index, settings=self._settings)['ok']
-        print self.es.get_settings(self._index)
-
-    def recreate(self):
-        self.delete()
-        self.create()
-
-    def flush(self):
-        self.es.refresh(self._index)
-
-    def index(self, table, value, bulk=False):
-        if not bulk:
-            self.es.index(self._index, table, value)
-            return
-        if table not in self._bulk:
-            self._bulk[table] = []
-        self._bulk[table].append(value)
-        if len(self._bulk[table]) > self.bulk_size:
-            self.flush_bulk(table, flush=False)
-
-    def flush_bulk(self, table, flush=True):
-        if len(self._bulk[table]):
-            self.es.bulk_index(self._index, table, self._bulk[table])
-            self._bulk[table] = []
-            if flush:
-                self.flush()
-
-
-class TracSearch(Search):
-    def __init__(self, url, bulk_size=100):
-        settings = {
-            'settings': {
-                'analysis': {
-                    'analyzer': {
-                        'myHTML': {
-                            'type': 'custom',
-                            'tokenizer': 'lowercase',
-                            'char_filter': ['html_strip']
-                        }
-                    }
-                }
-            }
-        }
-        super(TracSearch, self).__init__('trac', url, bulk_size=bulk_size, settings=settings)
-
-    def create(self):
-        super(TracSearch, self).create()
-        mapping = {
+class TracSearch(object):
+    def __init__(self, es):
+        self.es = es
+        self.types = dict(
+            ticket={
                 'ticket': {
                     '_all': {
                         'enabled': True
-                        },
+                    },
                     'properties': {
                         'description': {
                             'type': 'string',
                             'store': 'yes',
                             "term_vector": "with_positions_offsets"
-                            },
+                        },
                         'url': {
                             'type': 'string',
                             'store': 'yes',
                             'index': 'no'
-                            },
+                        },
                         'summary': {
                             'boost': 2.0,
                             'type': 'string',
                             'store': 'yes',
                             "term_vector": "with_positions_offsets"
-                            }
-                        },
-                        'comment': {
-                            'type': 'nested',
-                            'include_in_parent': True
-                        },
-                        'changetime': {
-                            'type': 'date',
-                            'store': 'yes'
                         }
+                    },
+                    'comment': {
+                        'type': 'nested',
+                        'include_in_parent': True
+                    },
+                    'changetime': {
+                        'type': 'date',
+                        'store': 'yes'
                     }
                 }
-        self.es.put_mapping(self._index, "ticket", mapping)
-        mapping = {
+            },
+            comment={
                 'comment': {
                     '_parent': {'type': 'ticket'},
                     'properties': {}
-                    }
                 }
-        self.es.put_mapping(self._index, "comment", mapping)
-        mapping = {
+            },
+            wiki={
                 'wiki': {
                     '_all': {
                         'enabled': True
-                        },
+                    },
                     'properties': {
                         'changetime': {
                             'type': 'date',
@@ -138,8 +79,107 @@ class TracSearch(Search):
                             'type': 'string',
                             'store': 'yes',
                             'index': 'no'
-                            },
+                        },
                     }
                 }
+            }
+        )
+
+    def ping(self):
+        return self.es.ping()
+
+    def prepare_indices(self):
+        settings = {
+            'analysis': {
+                'analyzer': {
+                    'myHTML': {
+                        'type': 'custom',
+                        'tokenizer': 'lowercase',
+                        'char_filter': ['html_strip']
+                    }
+                }
+            }
         }
-        self.es.put_mapping(self._index, "wiki", mapping)
+        if not self.es.indices.exists('trac'):
+            self.es.indices.create(index='trac', body={
+                'mappings': self.types,
+                'settings': settings}
+            )
+
+    def purge(self):
+        if self.es.indices.exists('trac'):
+            self.es.indices.delete('trac')
+
+    def refresh(self):
+        self.es.indices.refresh('trac')
+
+    def index(self, type_, values):
+        bulk(self.es, _wrap_index(type_, values))
+
+    def search(self, q, size=20, from_=0, start='', end='', selected=None):
+        if selected is None:
+            selected = {}
+        facets = ['status', 'user', 'priority', 'keywords',
+                  'component', '_type', 'path', 'domain']
+        # http://www.elasticsearch.org/guide/reference/query-dsl/query-string-query.html
+        query = {
+            'query': {
+                'query_string': {
+                    'query': q,
+                    'default_operator': 'AND'
+                }
+            },
+            'facets': {
+                'changetime': {
+                    'date_histogram': {
+                        'field': 'changetime',
+                        'interval': 'week'
+                    }
+                }
+            },
+            'highlight': {
+                "pre_tags": ["<b>"],
+                "post_tags": ["</b>"],
+                'fields': {
+                    '_all': {},
+                    'comment.comment': {},
+                    'description': {},
+                    'summary': {},
+                    'body': {},
+                    'name': {}
+                }
+            },
+            'filter': {},
+        }
+        for facet in facets:
+            query['facets'][facet] = {
+                'terms': {'field': facet}
+            }
+            if selected != {}:
+                query['facets'][facet]['facet_filter'] = {'term': selected}
+
+        if selected != {}:
+            query['filter'] = {'term': selected}
+            query['facets']['changetime']['facet_filter'] = {'term':
+                                                             selected}
+
+        if end != '':
+            filter_ = {'changetime': {
+                'from': int(start),
+                'to': int(end)
+            }
+            }
+            query['filter']['range'] = filter_
+            query['facets']['changetime']['facet_filter'] = {'range':
+                                                             filter_}
+        results = self.es.search(
+            index='trac', size=size, from_=from_, body=query
+        )
+        return results
+
+
+def _wrap_index(type_, values):
+    for value in values:
+        value['_index'] = 'trac'
+        value['_type'] = type_
+        yield value
